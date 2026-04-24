@@ -17,6 +17,8 @@ Client **Port Knocking** en PowerShell pour Windows — frappe automatiquement l
 - [Installation](#-installation)
 - [Utilisation](#-utilisation)
 - [Configuration de la séquence de ports](#-configuration-de-la-séquence-de-ports)
+- [Clé SSH chiffrée et passphrase](#-clé-ssh-chiffrée-et-passphrase)
+- [OTP / Authentification à deux facteurs](#-otp--authentification-à-deux-facteurs)
 - [Exemple de session](#-exemple-de-session)
 - [Dépannage](#-dépannage)
 - [Sécurité](#-sécurité)
@@ -56,10 +58,13 @@ Le script `knock-client.ps1` réalise les étapes suivantes :
 
 1. **Vérifie** que le client OpenSSH (`ssh`) est disponible dans le PATH
 2. **Demande interactivement** : IP du serveur, port SSH, nom d'utilisateur
-3. **Propose** d'utiliser une clé SSH privée (optionnel)
+3. **Propose** d'utiliser une clé SSH privée chiffrée (optionnel)
 4. **Envoie la séquence de frappes TCP** sur les ports `60006 → 40004 → 55555 → 44444 → 50005`
 5. **Attend 2 secondes** pour laisser le démon `knockd`/`fwknop` ouvrir le port
-6. **Lance la connexion SSH** avec les paramètres fournis
+6. **Lance la connexion SSH** avec les paramètres fournis — en préservant l'interactivité complète du terminal pour gérer automatiquement :
+   - la **passphrase** de la clé privée chiffrée
+   - le **mot de passe** SSH classique
+   - le code **OTP** (authentification à deux facteurs)
 
 ---
 
@@ -140,7 +145,95 @@ Exemple de configuration `knockd` correspondante (`/etc/knockd.conf`) :
 
 ---
 
+## 🔑 Clé SSH chiffrée et passphrase
+
+Il est fortement recommandé de **protéger votre clé privée avec une passphrase** (phrase de passe de chiffrement). Cela garantit que même si le fichier de clé est volé, il reste inutilisable sans la passphrase.
+
+### Générer une clé chiffrée avec passphrase
+
+```powershell
+ssh-keygen -t ed25519 -C "votre@email.com" -f "$env:USERPROFILE\.ssh\id_ed25519"
+# → L'outil vous demande de saisir (et confirmer) une passphrase
+```
+
+Laissez le champ vide pour créer une clé **sans** passphrase (déconseillé sur des machines partagées).
+
+### Comportement lors de la connexion
+
+Quand vous renseignez le chemin vers une clé chiffrée dans le script, le client SSH natif demande automatiquement la passphrase :
+
+```
+Entrez le chemin vers la clé privée (ex: C:\Users\Nom\.ssh\id_rsa) : C:\Users\Alice\.ssh\id_ed25519
+
+Envoi de la séquence de port knocking...
+  ...
+Lancement de la connexion SSH...
+Enter passphrase for key 'C:\Users\Alice\.ssh\id_ed25519':
+```
+
+> **Note :** La passphrase est saisie directement dans le terminal sécurisé du client SSH — le script ne la voit ni ne la stocke jamais.
+
+### Mémoriser la passphrase avec ssh-agent
+
+Pour éviter de retaper la passphrase à chaque connexion, activez `ssh-agent` et ajoutez votre clé :
+
+```powershell
+# Démarrer ssh-agent (une seule fois par session)
+Start-Service ssh-agent
+
+# Ajouter la clé (la passphrase est demandée une seule fois)
+ssh-add "$env:USERPROFILE\.ssh\id_ed25519"
+```
+
+Une fois la clé ajoutée à l'agent, le script se connecte sans redemander la passphrase.
+
+---
+
+## 🔢 OTP / Authentification à deux facteurs
+
+Si votre serveur SSH est configuré avec une authentification à deux facteurs (2FA) via un **OTP** (One-Time Password, par exemple Google Authenticator, Authy, ou `libpam-google-authenticator`), le script le supporte nativement.
+
+### Comportement lors de la connexion
+
+Le client SSH interactif affiche le prompt OTP après la phase d'authentification par clé ou par mot de passe :
+
+```
+Lancement de la connexion SSH...
+Verification code:
+```
+
+> Saisissez le code à 6 chiffres affiché par votre application d'authentification.
+
+### Configurer le 2FA côté serveur (rappel)
+
+Sur le serveur Linux, l'exemple classique avec `libpam-google-authenticator` :
+
+```bash
+# Installation
+sudo apt install libpam-google-authenticator
+
+# Configuration pour l'utilisateur
+google-authenticator
+```
+
+Puis dans `/etc/pam.d/sshd` :
+```
+auth required pam_google_authenticator.so
+```
+
+Et dans `/etc/ssh/sshd_config` :
+```
+ChallengeResponseAuthentication yes
+AuthenticationMethods publickey,keyboard-interactive
+```
+
+Le script `knock-client.ps1` n'a rien à modifier — le TTY natif préserve tous les échanges interactifs avec le serveur SSH.
+
+---
+
 ## 💻 Exemple de session
+
+### Connexion avec clé chiffrée (passphrase)
 
 ```
 Entrez l'adresse IP du serveur : 203.0.113.42
@@ -156,6 +249,29 @@ Envoi de la séquence de port knocking...
   Frappe sur le port 44444...
   Frappe sur le port 50005...
 Séquence terminée. Attente de l'ouverture du port par le serveur...
+Lancement de la connexion SSH...
+
+Enter passphrase for key 'C:\Users\Alice\.ssh\id_ed25519':
+```
+
+### Connexion avec clé chiffrée + OTP (2FA)
+
+```
+Lancement de la connexion SSH...
+
+Enter passphrase for key 'C:\Users\Alice\.ssh\id_ed25519':
+Verification code:
+
+alice@203.0.113.42:~$
+```
+
+### Connexion par mot de passe uniquement
+
+```
+Utiliser une clé SSH pour se connecter ? (o/N) : n
+
+Envoi de la séquence de port knocking...
+  ...
 Lancement de la connexion SSH...
 
 alice@203.0.113.42's password:
@@ -194,14 +310,32 @@ Le chemin saisi ne pointe pas vers un fichier existant. Vérifier le chemin avec
 Test-Path "C:\Users\VotreNom\.ssh\id_rsa"
 ```
 
+### ❌ La passphrase de la clé est redemandée à chaque connexion
+
+Utiliser `ssh-agent` pour mettre la clé en mémoire :
+```powershell
+Start-Service ssh-agent
+ssh-add "$env:USERPROFILE\.ssh\id_ed25519"
+```
+
+### ❌ Le code OTP est refusé (`Permission denied`)
+
+- Vérifier que l'heure système de votre PC est bien synchronisée (les codes TOTP sont sensibles à la dérive temporelle)
+- Vérifier la configuration `ChallengeResponseAuthentication yes` dans `/etc/ssh/sshd_config` sur le serveur
+- Saisir le code **immédiatement** après l'avoir généré (durée de validité : 30 secondes)
+
 ---
 
 ## 🔒 Sécurité
 
 - La séquence de ports est codée en dur dans le script : **ne pas partager publiquement votre version modifiée** si la séquence est secrète.
-- Le script ne stocke ni ne transmet aucune information d'authentification — les mots de passe sont gérés directement par le client SSH natif.
-- Pour une sécurité maximale, combiner le port knocking avec une **clé SSH** (pas de mot de passe).
-- Envisager `fwknop` (Single Packet Authorization) pour une approche encore plus robuste.
+- Le script ne stocke ni ne transmet aucune information d'authentification — les mots de passe, passphrases et codes OTP sont gérés directement par le client SSH natif dans un TTY sécurisé.
+- Pour une sécurité maximale, combiner :
+  1. **Port Knocking** — masque le port SSH
+  2. **Clé SSH chiffrée** — remplace le mot de passe par une clé cryptographique
+  3. **Passphrase** — protège la clé privée en cas de vol du fichier
+  4. **OTP / 2FA** — ajoute un second facteur d'authentification
+- Envisager `fwknop` (Single Packet Authorization) pour une approche encore plus robuste (paquet unique chiffré et signé).
 
 ---
 
