@@ -73,11 +73,16 @@ foreach ($port in $ports) {
         # Tente de se connecter à l'hôte cible sur le port actuel de façon asynchrone
         $IAsyncResult = $client.BeginConnect($targetHost, $port, $null, $null)
 
-        # Attend au maximum 50 ms que le paquet SYN parte, puis termine proprement l'opération asynchrone.
-        # EndConnect est appelé dans son propre try/catch : une exception ici est attendue car les ports
-        # de knocking sont fermés par définition — c'est le comportement normal du port knocking.
-        $IAsyncResult.AsyncWaitHandle.WaitOne(50) | Out-Null
-        try { $client.EndConnect($IAsyncResult) } catch {}
+        # Attend au maximum 50 ms que la réponse du serveur arrive.
+        # Si WaitOne retourne $true, l'opération async est terminée (RST reçu) et EndConnect est
+        # appelé pour libérer les ressources. Si WaitOne retourne $false (timeout, SYN silencieusement
+        # ignoré par le firewall), EndConnect est volontairement ignoré : l'appeler sur une opération
+        # async non terminée bloquerait le script pendant plusieurs secondes (timeout TCP de l'OS).
+        # La fermeture du socket dans le bloc finally annule immédiatement l'opération en cours.
+        $connected = $IAsyncResult.AsyncWaitHandle.WaitOne(50)
+        if ($connected) {
+            try { $client.EndConnect($IAsyncResult) } catch {}
+        }
     }
     catch {
         # Les erreurs sont silencieusement ignorées car le port est fermé (comportement attendu du port knocking)
