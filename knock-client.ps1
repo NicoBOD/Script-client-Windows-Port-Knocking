@@ -5,54 +5,53 @@ if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# Demande à l'utilisateur l'adresse IP du serveur
-$targetHost = Read-Host "Entrez l'adresse IP du serveur"
-
-# Valide que l'adresse IP n'est pas vide
-if ([string]::IsNullOrWhiteSpace($targetHost)) {
-    Write-Host "Erreur : l'adresse IP du serveur est requise." -ForegroundColor Red
-    Read-Host -Prompt "Appuyez sur Entrée pour fermer la fenêtre"
-    exit 1
-}
-
-# Demande à l'utilisateur le port SSH
-$sshPort = Read-Host "Entrez le port SSH (par défaut 22)"
-
-# Si l'utilisateur ne rentre pas de port, utiliser le port 22 par défaut
-if ([string]::IsNullOrWhiteSpace($sshPort)) {
-    $sshPort = 22
-} else {
-    # Valide que le port est un entier compris entre 1 et 65535
-    if ($sshPort -notmatch '^\d+$' -or [int]$sshPort -lt 1 -or [int]$sshPort -gt 65535) {
-        Write-Host "Erreur : le port SSH doit être un entier compris entre 1 et 65535." -ForegroundColor Red
-        Read-Host -Prompt "Appuyez sur Entrée pour fermer la fenêtre"
-        exit 1
+# Demande à l'utilisateur l'adresse IP du serveur (relance la demande si vide)
+do {
+    $targetHost = Read-Host "Entrez l'adresse IP du serveur"
+    if ([string]::IsNullOrWhiteSpace($targetHost)) {
+        Write-Host "Erreur : l'adresse IP du serveur est requise." -ForegroundColor Red
     }
-    $sshPort = [int]$sshPort
-}
+} while ([string]::IsNullOrWhiteSpace($targetHost))
 
-# Demande à l'utilisateur le nom d'utilisateur pour la connexion SSH
-$username = Read-Host "Entrez le nom d'utilisateur SSH"
+# Demande à l'utilisateur le port SSH (relance la demande si invalide)
+$validPort = $false
+do {
+    $sshPort = Read-Host "Entrez le port SSH (par défaut 22)"
+    if ([string]::IsNullOrWhiteSpace($sshPort)) {
+        $sshPort = 22
+        $validPort = $true
+    } elseif ($sshPort -notmatch '^\d+$' -or [int]$sshPort -lt 1 -or [int]$sshPort -gt 65535) {
+        Write-Host "Erreur : le port SSH doit être un entier compris entre 1 et 65535." -ForegroundColor Red
+    } else {
+        $sshPort = [int]$sshPort
+        $validPort = $true
+    }
+} while (-not $validPort)
 
-# Valide que le nom d'utilisateur n'est pas vide
-if ([string]::IsNullOrWhiteSpace($username)) {
-    Write-Host "Erreur : le nom d'utilisateur SSH est requis." -ForegroundColor Red
-    Read-Host -Prompt "Appuyez sur Entrée pour fermer la fenêtre"
-    exit 1
-}
+# Demande à l'utilisateur le nom d'utilisateur pour la connexion SSH (relance la demande si vide)
+do {
+    $username = Read-Host "Entrez le nom d'utilisateur SSH"
+    if ([string]::IsNullOrWhiteSpace($username)) {
+        Write-Host "Erreur : le nom d'utilisateur SSH est requis." -ForegroundColor Red
+    }
+} while ([string]::IsNullOrWhiteSpace($username))
 
 # Demande à l'utilisateur s'il utilise une clé SSH
 $useKey = Read-Host "Utiliser une clé SSH pour se connecter ? (o/N)"
 $keyPath = ""
 
 if ($useKey -match "^[oO]") {
-    $keyPath = Read-Host "Entrez le chemin vers la clé privée (ex: C:\Users\Nom\.ssh\id_rsa)"
-    # Vérifie que le fichier de clé privée existe avant de continuer
-    if (-not (Test-Path $keyPath)) {
-        Write-Host "Erreur : le fichier de clé privée est introuvable : $keyPath" -ForegroundColor Red
-        Read-Host -Prompt "Appuyez sur Entrée pour fermer la fenêtre"
-        exit 1
-    }
+    $validKey = $false
+    do {
+        $keyPath = Read-Host "Entrez le chemin vers la clé privée (ex: C:\Users\Nom\.ssh\id_rsa)"
+        if (Test-Path $keyPath -PathType Container) {
+            Write-Host "Erreur : le chemin spécifié est un dossier, pas un fichier. Veuillez entrer le chemin complet vers le fichier de clé privée (ex: C:\Users\Nom\.ssh\id_rsa)." -ForegroundColor Red
+        } elseif (-not (Test-Path $keyPath)) {
+            Write-Host "Erreur : le fichier de clé privée est introuvable : $keyPath" -ForegroundColor Red
+        } else {
+            $validKey = $true
+        }
+    } while (-not $validKey)
 }
 
 # Définis la séquence de ports à frapper pour le port knocking (écrite en dur)
@@ -74,11 +73,16 @@ foreach ($port in $ports) {
         # Tente de se connecter à l'hôte cible sur le port actuel de façon asynchrone
         $IAsyncResult = $client.BeginConnect($targetHost, $port, $null, $null)
 
-        # Attend au maximum 100 ms que le paquet SYN parte, puis termine proprement l'opération asynchrone.
-        # EndConnect est appelé dans son propre try/catch : une exception ici est attendue car les ports
-        # de knocking sont fermés par définition — c'est le comportement normal du port knocking.
-        $IAsyncResult.AsyncWaitHandle.WaitOne(100) | Out-Null
-        try { $client.EndConnect($IAsyncResult) } catch {}
+        # Attend au maximum 50 ms que la réponse du serveur arrive.
+        # Si WaitOne retourne $true, l'opération async est terminée (RST reçu) et EndConnect est
+        # appelé pour libérer les ressources. Si WaitOne retourne $false (timeout, SYN silencieusement
+        # ignoré par le firewall), EndConnect est volontairement ignoré : l'appeler sur une opération
+        # async non terminée bloquerait le script pendant plusieurs secondes (timeout TCP de l'OS).
+        # La fermeture du socket dans le bloc finally annule immédiatement l'opération en cours.
+        $connected = $IAsyncResult.AsyncWaitHandle.WaitOne(50)
+        if ($connected) {
+            try { $client.EndConnect($IAsyncResult) } catch {}
+        }
     }
     catch {
         # Les erreurs sont silencieusement ignorées car le port est fermé (comportement attendu du port knocking)
